@@ -1,0 +1,8 @@
+[package]
+name = "borrow_bounds"
+version = "0.1.0"
+authors = ["Paul Faria <Nashenas88@gmail.com>"]
+
+[dependencies]
+clap = "2.14"
+regex = "*"
