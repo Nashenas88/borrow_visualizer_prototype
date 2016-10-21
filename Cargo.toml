@@ -5,4 +5,3 @@ authors = ["Paul Faria <Nashenas88@gmail.com>"]
 
 [dependencies]
 clap = "2.14"
-regex = "*"

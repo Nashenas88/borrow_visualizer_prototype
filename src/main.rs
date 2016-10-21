@@ -1,9 +1,5 @@
-#![feature(box_syntax, rustc_private, conservative_impl_trait)]
-macro_rules! regex {
-    ($r:expr) => (::regex::Regex::new($r).unwrap())
-}
+#![feature(box_syntax, rustc_private, conservative_impl_trait, rustc_diagnostic_macros)]
 
-extern crate regex;
 extern crate getopts;
 extern crate rustc;
 extern crate rustc_driver;
@@ -11,6 +7,8 @@ extern crate rustc_borrowck;
 extern crate syntax;
 extern crate syntax_pos;
 extern crate clap;
+#[macro_use]
+extern crate log;
 
 use rustc::cfg;
 use rustc::session::Session;
@@ -39,6 +37,7 @@ impl BorrowCalls {
 
 impl<'a> CompilerCalls<'a> for BorrowCalls {
     fn build_controller(&mut self, _: &Session, _: &getopts::Matches) -> driver::CompileController<'a> {
+        debug!("build controller..");
         let mut control = driver::CompileController::basic();
         control.after_analysis.stop = Compilation::Stop;
 
@@ -46,7 +45,7 @@ impl<'a> CompilerCalls<'a> for BorrowCalls {
         let offset = self.offset;
         let line = self.line.clone();
         control.after_analysis.callback = box move |compile_state: &mut driver::CompileState| {
-            let tcx = if let Some(tcx) = compile_state.tcx { tcx } else { println!("DEBUG: no tcx"); return; };
+            let tcx = if let Some(tcx) = compile_state.tcx { tcx } else { debug!("no tcx"); return; };
             let (node_id, node, fn_like, fn_node) = nodeid_from_offset_and_line(tcx, offset, &line)
                 .expect(&format!("unable to find matching nodeid for offset {} at line {:?}", offset, line));
 
@@ -56,20 +55,27 @@ impl<'a> CompilerCalls<'a> for BorrowCalls {
                 compile_state.mir_map,
                 fn_like.to_fn_parts(),
                 &cfg);
-            println!("Found {} loans within fn identified by {}:\n{:?}\n{:?}", analysis_data.all_loans.len(), node_id.as_u32(), node, fn_node);
+            debug!("Found {} loans within fn identified by {}:\n{:?}\n{:?}", analysis_data.all_loans.len(), node_id.as_u32(), node, fn_node);
 
             // gather and return analysis data when loan internals can be accessed imm
-            for loan in analysis_data.all_loans.iter().filter(|&loan| loan.loan_path().belongs_to(node_id)) {
-                println!("{:?}", loan);
-                let kind_str = match loan.kind() {
-                    ty::BorrowKind::ImmBorrow => "ImmBorrow",
-                    ty::BorrowKind::MutBorrow => "MutBorrow",
-                    ty::BorrowKind::UniqueImmBorrow => "UniqueImmBorrow"
-                };
-                let gen_span = loan.gen_scope().span(&tcx.region_maps, &tcx.map);
-                let kill_span = loan.kill_scope().span(&tcx.region_maps, &tcx.map);
-                println!(/*"{} "*/"{}: {:?}-{:?}", /*loan.index(),*/ kind_str, gen_span, kill_span);
-            }
+            println!("[{}]", analysis_data.all_loans.iter()
+                // we only care abouts loans related to our target
+                .filter(|&loan| loan.loan_path().belongs_to(node_id))
+                .map(|loan| {
+                    debug!("{:?}", loan);
+                    let kind_str = match loan.kind() {
+                        ty::BorrowKind::ImmBorrow => "imm",
+                        ty::BorrowKind::MutBorrow => "mut",
+                        ty::BorrowKind::UniqueImmBorrow => "uimm"
+                    };
+                    let span = loan.span();
+                    // let gen_span = loan.gen_scope().span(&tcx.region_maps, &tcx.map);
+                    // let kill_span = loan.kill_scope().span(&tcx.region_maps, &tcx.map);
+                    format!("{{\"kind\":\"{}\", \"start\":\"{}\", \"end\":\"{}\"}}",
+                        kind_str, span.lo.0, span.hi.0)
+                })
+                .collect::<Vec<_>>()
+                .join(","));
         };
 
         control
@@ -99,9 +105,9 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: us
             //intln!("looking at {:?}", node);
             let (lo, hi) = (sp.lo.0 as usize, sp.hi.0 as usize);
             if line.start <= lo && lo <= offset && offset <= hi && hi <= line.end {
-                println!("Looking at nodeid {}", id.as_u32());
-                println!("lo: {}, hi: {}", lo, hi);
-                println!("found matching block: {:?}", node);
+                debug!("Looking at nodeid {}", id.as_u32());
+                debug!("lo: {}, hi: {}", lo, hi);
+                debug!("found matching block: {:?}", node);
                 match node {
                     // These cannot be reliably printed.
                     // hir_map::NodeLocal(_) | hir_map::NodeStructCtor(_) => continue,
@@ -150,42 +156,43 @@ fn parse_nums(matches: &clap::ArgMatches) -> Result<(usize, usize, usize), std::
 
 fn main() {
     let args: Vec<_> = std::env::args().collect();
-    // let matches = App::new("Borrow Visualizer")
-    //     .version("0.1")
-    //     .author("Paul D. Faria")
-    //     .about("Poorly finds borrow spans")
-    //     .arg(Arg::with_name("offset")
-    //             .short("o")
-    //             .long("offset")
-    //             .value_name("OFFSET_BYTES")
-    //             .help("The number of bytes from the start of the file to the item to analyze.")
-    //             .takes_value(true)
-    //             .required(true))
-    //     .arg(Arg::with_name("line_start")
-    //             .short("s")
-    //             .long("start")
-    //             .value_name("BYTES")
-    //             .help("The number of bytes from the start of the file to the start of the line of the item to analyze.")
-    //             .takes_value(true)
-    //             .required(true))
-    //     .arg(Arg::with_name("line_end")
-    //             .short("e")
-    //             .long("end")
-    //             .value_name("BYTES")
-    //             .help("The number of bytes from the start of the file to the end of the line of the item to anaylize.")
-    //             .takes_value(true)
-    //             .required(true))
-    //     .setting(clap::AppSettings::TrailingVarArg)
-    //     .arg(Arg::from_usage("<args>... 'args to pass to compiler'"))
-    //     .get_matches();
-    // let (offset, line_start, line_end) = match parse_nums(&matches) {
-    //     Ok((o, s, e)) => (o, s, e),
-    //     Err(e) => panic!(e),
-    // };
+    // collect the program name ahead of time
+    let prog = args[0].clone();
 
-    // let args: Vec<String> = matches.values_of("args").unwrap().map(|s| s.to_string()).collect();
-    // println!("{} {} {}", offset, line_start, line_end);
-    // println!("{:?}", args);
-    rustc_driver::run_compiler(&args, &mut BorrowCalls::new(172, 160..220), None, None);
-    //1293, 1276..1387
+    let matches = App::new("Borrow Visualizer")
+        .version("0.1")
+        .author("Paul D. Faria")
+        .about("Poorly finds borrow spans")
+        .arg(Arg::with_name("offset")
+                .short("o")
+                .long("offset")
+                .value_name("OFFSET_BYTES")
+                .help("The number of bytes from the start of the file to the item to analyze.")
+                .takes_value(true)
+                .required(true))
+        .arg(Arg::with_name("line_start")
+                .short("s")
+                .long("start")
+                .value_name("BYTES")
+                .help("The number of bytes from the start of the file to the start of the line of the item to analyze.")
+                .takes_value(true)
+                .required(true))
+        .arg(Arg::with_name("line_end")
+                .short("e")
+                .long("end")
+                .value_name("BYTES")
+                .help("The number of bytes from the start of the file to the end of the line of the item to anaylize.")
+                .takes_value(true)
+                .required(true))
+        .setting(clap::AppSettings::TrailingVarArg)
+        .arg(Arg::from_usage("<args>... 'args to pass to compiler'"))
+        .get_matches();
+    let (offset, line_start, line_end) = match parse_nums(&matches) {
+        Ok((o, s, e)) => (o, s, e),
+        Err(e) => panic!(e),
+    };
+
+    let mut args: Vec<String> = matches.values_of("args").unwrap().map(|s| s.to_string()).collect();
+    args.insert(0, prog); // prepend prog back to beginning of args
+    rustc_driver::run_compiler(&args, &mut BorrowCalls::new(offset, line_start..line_end), None, None);
 }
