@@ -185,7 +185,7 @@ fn main() {
                 .takes_value(true)
                 .required(true))
         .setting(clap::AppSettings::TrailingVarArg)
-        .arg(Arg::from_usage("<args>... 'args to pass to compiler'"))
+        .arg(Arg::from_usage("<args>... 'args to pass to the compiler'"))
         .get_matches();
     let (offset, line_start, line_end) = match parse_nums(&matches) {
         Ok((o, s, e)) => (o, s, e),
