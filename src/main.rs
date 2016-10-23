@@ -1,4 +1,4 @@
-#![feature(box_syntax, rustc_private, conservative_impl_trait, rustc_diagnostic_macros)]
+#![feature(box_syntax, rustc_private, conservative_impl_trait, rustc_diagnostic_macros, str_escape)]
 
 extern crate getopts;
 extern crate rustc;
@@ -17,38 +17,88 @@ use rustc::hir::map as hir_map;
 use rustc::hir::map::blocks;
 use rustc_borrowck as borrowck;
 use rustc_driver::{driver, CompilerCalls, Compilation};
-use clap::{Arg, App};
+use clap::{Arg, App, SubCommand};
+use syntax_pos::BytePos;
 
 use std::ops::Range;
 use std::io::Write;
+use std::fmt::Display;
+use std::borrow::Cow;
 
-struct BorrowCalls {
-    offset: usize,
-    line: Range<usize>
+#[derive(Clone)]
+enum InputKind<'a> {
+    Bytes(BytePos, Range<BytePos>),
+    LineInfo(&'a str, usize, usize)
 }
 
-impl BorrowCalls {
-    fn new(offset: usize, line: Range<usize>) -> BorrowCalls {
+#[derive(Clone)]
+struct BorrowCalls<'a> {
+    input: InputKind<'a>
+}
+
+impl<'a> BorrowCalls<'a> {
+    fn with_bytes(offset: BytePos, line: Range<BytePos>) -> Self {
         BorrowCalls {
-            offset: offset,
-            line: line
+            input: InputKind::Bytes(offset, line)
+        }
+    }
+
+    fn with_line_info(file_name: &'a str, line: usize, column: usize) -> Self {
+        BorrowCalls {
+            input: InputKind::LineInfo(file_name, line, column)
+        }
+    }
+
+    fn get_byte_info<'t, 'tcx>(&self, tcx: TyCtxt<'t, 'tcx, 'tcx>) -> Result<(BytePos, Range<BytePos>), String> {
+        match self.input {
+            InputKind::Bytes(offset, ref line) => Ok((offset, line.clone())),
+            InputKind::LineInfo(file_name, line, column) => {
+                let file_map = match tcx.sess.codemap().get_filemap(file_name) {
+                    Some(fm) => fm,
+                    None => {
+                        return Err(gen_error("filename not found"));
+                    }
+                };
+
+                let file_lines = file_map.lines.borrow();
+                let line_start = file_lines[line];
+                let line_end = if line >= file_lines.len() {
+                    file_map.end_pos
+                } else {
+                    match file_lines[line+1] {
+                        BytePos(i) => BytePos(i - 1)
+                    }
+                };
+                let offset = match line_start {
+                    BytePos(i) => BytePos(i + column as u32)
+                };
+
+                Ok((offset, line_start..line_end))
+            }
         }
     }
 }
 
-impl<'a> CompilerCalls<'a> for BorrowCalls {
+impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
     fn build_controller(&mut self, _: &Session, _: &getopts::Matches) -> driver::CompileController<'a> {
         debug!("build controller..");
         let mut control = driver::CompileController::basic();
         control.after_analysis.stop = Compilation::Stop;
 
-        // reassign so we don't capture self
-        let offset = self.offset;
-        let line = self.line.clone();
+        // reassign since we can't capture self
+        let this = self.clone();
         control.after_analysis.callback = box move |compile_state: &mut driver::CompileState| {
             let tcx = if let Some(tcx) = compile_state.tcx { tcx } else { debug!("no tcx"); return; };
+            let (offset, line) = match this.get_byte_info(tcx) {
+                Ok((o, l)) => (o, l),
+                Err(e) => {
+                    print_error(format!("{}", e));
+                    return;
+                }
+            };
+
             let (node_id, node, fn_like, fn_node) = nodeid_from_offset_and_line(tcx, offset, &line)
-                .expect(&format!("unable to find matching nodeid for offset {} at line {:?}", offset, line));
+                .expect(&format!("unable to find matching nodeid for offset {} at line {:?}", offset.0, line));
 
             let cfg = cfg::CFG::new(tcx, &fn_like.body());
             let (_, analysis_data) = borrowck::build_borrowck_dataflow_data_for_fn(
@@ -83,7 +133,7 @@ impl<'a> CompilerCalls<'a> for BorrowCalls {
     }
 }
 
-fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: usize, line: &Range<usize>)
+fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: BytePos, line: &Range<BytePos>)
         -> Option<(syntax::ast::NodeId, hir_map::Node<'tcx>, blocks::FnLikeNode<'tcx>, hir_map::Node<'tcx>)> {
     for (&id, _) in tcx.node_types().iter() {
         let node = if let Some(node) = tcx.map.find(id) {
@@ -99,13 +149,11 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: us
         if let Some(sp) = tcx.map.opt_span(id) {
             // Avoid peeking at macro expansions.
             if sp.expn_id != syntax_pos::NO_EXPANSION {
-                //intln!("In macro");
                 continue;
             }
 
-            //intln!("looking at {:?}", node);
-            let (lo, hi) = (sp.lo.0 as usize, sp.hi.0 as usize);
-            if line.start <= lo && lo <= offset && offset <= hi && hi <= line.end {
+            let (lo, hi) = (sp.lo.0 as u32, sp.hi.0 as u32);
+            if line.start.0 <= lo && lo <= offset.0 && offset.0 <= hi && hi <= line.end.0 {
                 debug!("Looking at nodeid {}", id.as_u32());
                 debug!("lo: {}, hi: {}", lo, hi);
                 debug!("found matching block: {:?}", node);
@@ -120,14 +168,14 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: us
                         loop {
                             if parent_id == old_id {
                                 // reached the root
-                                return None;
+                                continue;
                             }
 
                             let parent_node = if let Some(node) = tcx.map.find(parent_id) {
                                 node
                             } else {
                                 // unable to find node
-                                return None;
+                                continue;
                             };
 
                             let code = blocks::Code::from_node(parent_node);
@@ -147,12 +195,76 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: us
     None
 }
 
-fn parse_nums(matches: &clap::ArgMatches) -> Result<(usize, usize, usize), std::num::ParseIntError> {
-    let offset = try!(matches.value_of("offset").unwrap().parse::<usize>());
-    let line_start = try!(matches.value_of("line_start").unwrap().parse::<usize>());
-    let line_end = try!(matches.value_of("line_end").unwrap().parse::<usize>());
+#[derive(Debug)]
+enum ParseError<'a> {
+    ParseIntKind(std::num::ParseIntError),
+    StrKind(Cow<'a,str>)
+}
 
-    Ok((offset, line_start, line_end))
+impl<'a> From<std::num::ParseIntError> for ParseError<'a> {
+    fn from(e: std::num::ParseIntError) -> Self {
+        ParseError::ParseIntKind(e)
+    }
+}
+
+impl<'a> From<&'a str> for ParseError<'a> {
+    fn from(e: &'a str) -> Self {
+        ParseError::StrKind(Cow::Borrowed(e))
+    }
+}
+
+impl<'a> From<String> for ParseError<'a> {
+    fn from(e: String) -> Self {
+        ParseError::StrKind(Cow::Owned(e))
+    }
+}
+
+impl<'a> Display for ParseError<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            &ParseError::ParseIntKind(ref e) => e.fmt(f),
+            &ParseError::StrKind(ref e) => write!(f, "{}", e)
+        }
+    }
+}
+
+fn parse_input<'a: 'b, 'b>(matches: &'a clap::ArgMatches) -> Result<(BorrowCalls<'b>, Vec<String>), ParseError<'b>> {
+    match matches.subcommand() {
+        ("bytes", Some(sub_m)) => {
+            let offset = try!(sub_m.value_of("offset").unwrap().parse::<u32>());
+            let line_start = try!(sub_m.value_of("line_start").unwrap().parse::<u32>());
+            let line_end = try!(sub_m.value_of("line_end").unwrap().parse::<u32>());
+            let line = BytePos(line_start)..BytePos(line_end);
+
+            match sub_m.values_of("args") {
+                Some(args) => {
+                    let borrow_calls = BorrowCalls::with_bytes(BytePos(offset), line);
+                    let args = args.map(str::to_string).collect();
+                    Ok((borrow_calls, args))
+                },
+                None => {
+                    Err(gen_error("Compiler args are missing").into())
+                }
+            }
+        },
+        ("line", Some(sub_m)) => {
+            let file_name = sub_m.value_of("file_name").unwrap();
+            let line = try!(sub_m.value_of("line").unwrap().parse::<usize>());
+            let column = try!(sub_m.value_of("column").unwrap().parse::<usize>());
+
+            match sub_m.values_of("args") {
+                Some(args) => {
+                    let borrow_calls = BorrowCalls::with_line_info(file_name, line, column);
+                    let args = args.map(str::to_string).collect();
+                    Ok((borrow_calls, args))
+                },
+                None => {
+                    Err(gen_error("Compiler args are missing").into())
+                }
+            }
+        },
+        (cmd, _) => Err(gen_error(format!("Unrecognized subcommand: {}", cmd)).into())
+    }
 }
 
 // Takes buffers and never outputs them
@@ -160,6 +272,7 @@ struct BlackHole {}
 
 impl Write for BlackHole {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // pretend we wrote everything or the compiler will error out
         Ok(buf.len())
     }
 
@@ -170,45 +283,74 @@ impl Write for BlackHole {
 
 unsafe impl Send for BlackHole {}
 
+fn extend_args<'a>(app: App<'a, 'a>) -> App<'a, 'a> {
+    app.setting(clap::AppSettings::TrailingVarArg)
+        .arg(Arg::from_usage("<args>... 'arguments to pass to the compiler.'"))
+}
+
+fn get_matches<'a>() -> clap::ArgMatches<'a> {
+    App::new("Borrow Visualizer")
+        .version("0.1")
+        .author("Paul D. Faria")
+        .about("Poorly finds borrow spans")
+        .subcommand(extend_args(SubCommand::with_name("bytes")
+            .arg(Arg::with_name("offset")
+                    .value_name("OFFSET_BYTES")
+                    .help("The number of bytes from the start of the file to the item to analyze.")
+                    .takes_value(true)
+                    .required(true))
+            .arg(Arg::with_name("line_start")
+                    .value_name("LINE_START_BYTES")
+                    .help("The number of bytes from the start of the file to the start of the line of the item to analyze.")
+                    .takes_value(true)
+                    .required(true))
+            .arg(Arg::with_name("line_end")
+                    .value_name("LINE_END_BYTES")
+                    .help("The number of bytes from the start of the file to the end of the line of the item to anaylize.")
+                    .takes_value(true)
+                    .required(true))))
+        .subcommand(extend_args(SubCommand::with_name("line")
+            .arg(Arg::with_name("file_name")
+                .value_name("FILE_NAME")
+                .help("The name of the file that's being analyzed.")
+                .takes_value(true)
+                .required(true))
+            .arg(Arg::with_name("line")
+                .value_name("LINE_NUMBER")
+                .help("The line number for the item to analyze.")
+                .takes_value(true)
+                .required(true))
+            .arg(Arg::with_name("column")
+                .value_name("COLUMN_NUMBER")
+                .help("The column number for the item to analyze.")
+                .takes_value(true)
+                .required(true))))
+        .get_matches()
+}
+
+fn gen_error<'a, T>(message: T) -> String where T: Into<Cow<'a, str>> {
+    let message = message.into().to_owned().escape_default();
+    format!("[{{\"error\":\"{}\"}}]", message)
+}
+
+fn print_error<'a, T>(message: T) where T: Into<Cow<'a, str>> {
+    println!("{}", gen_error(message));
+}
+
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     // collect the program name ahead of time
     let prog = args[0].clone();
 
-    let matches = App::new("Borrow Visualizer")
-        .version("0.1")
-        .author("Paul D. Faria")
-        .about("Poorly finds borrow spans")
-        .arg(Arg::with_name("offset")
-                .short("o")
-                .long("offset")
-                .value_name("OFFSET_BYTES")
-                .help("The number of bytes from the start of the file to the item to analyze.")
-                .takes_value(true)
-                .required(true))
-        .arg(Arg::with_name("line_start")
-                .short("s")
-                .long("start")
-                .value_name("BYTES")
-                .help("The number of bytes from the start of the file to the start of the line of the item to analyze.")
-                .takes_value(true)
-                .required(true))
-        .arg(Arg::with_name("line_end")
-                .short("e")
-                .long("end")
-                .value_name("BYTES")
-                .help("The number of bytes from the start of the file to the end of the line of the item to anaylize.")
-                .takes_value(true)
-                .required(true))
-        .setting(clap::AppSettings::TrailingVarArg)
-        .arg(Arg::from_usage("<args>... 'args to pass to the compiler'"))
-        .get_matches();
-    let (offset, line_start, line_end) = match parse_nums(&matches) {
-        Ok((o, s, e)) => (o, s, e),
-        Err(e) => panic!(e),
+    let matches = get_matches();
+    let (mut borrow_calls, mut args) = match parse_input(&matches) {
+        Ok(bc) => bc,
+        Err(e) => {
+            print_error(format!("{}", e));
+            return;
+        },
     };
 
-    let mut args: Vec<String> = matches.values_of("args").unwrap().map(|s| s.to_string()).collect();
-    args.insert(0, prog); // prepend prog back to beginning of args
-    rustc_driver::run_compiler(&args, &mut BorrowCalls::new(offset, line_start..line_end), None, Some(box BlackHole{}));
+    args.insert(0, prog); // prepend program name back to beginning of remaining args
+    rustc_driver::run_compiler(&args, &mut borrow_calls, None, Some(box BlackHole{}));
 }
