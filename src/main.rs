@@ -28,7 +28,7 @@ use std::borrow::Cow;
 #[derive(Clone)]
 enum InputKind<'a> {
     Bytes(BytePos, Range<BytePos>),
-    LineInfo(&'a str, usize, usize)
+    LineInfo(&'a str, u32, u32)
 }
 
 #[derive(Clone)]
@@ -43,7 +43,7 @@ impl<'a> BorrowCalls<'a> {
         }
     }
 
-    fn with_line_info(file_name: &'a str, line: usize, column: usize) -> Self {
+    fn with_line_info(file_name: &'a str, line: u32, column: u32) -> Self {
         BorrowCalls {
             input: InputKind::LineInfo(file_name, line, column)
         }
@@ -60,17 +60,18 @@ impl<'a> BorrowCalls<'a> {
                     }
                 };
 
+                let line_idx = line as usize;
                 let file_lines = file_map.lines.borrow();
-                let line_start = file_lines[line];
-                let line_end = if line >= file_lines.len() {
+                let line_start = file_lines[line_idx];
+                let line_end = if line_idx >= file_lines.len() {
                     file_map.end_pos
                 } else {
-                    match file_lines[line+1] {
+                    match file_lines[line_idx + 1] {
                         BytePos(i) => BytePos(i - 1)
                     }
                 };
                 let offset = match line_start {
-                    BytePos(i) => BytePos(i + column as u32)
+                    BytePos(i) => BytePos(i + column)
                 };
 
                 Ok((offset, line_start..line_end))
@@ -162,6 +163,7 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: By
                     // hir_map::NodeLocal(_) | hir_map::NodeStructCtor(_) => continue,
                     // There is an associated NodeExpr(ExprBlock) where this actually matters.
                     hir_map::NodeBlock(_) => continue,
+                    // TODO Needs to be narrowed down more
                     _ => {
                         let mut old_id = id;
                         let mut parent_id = tcx.map.get_parent_node(id);
@@ -228,40 +230,34 @@ impl<'a> Display for ParseError<'a> {
     }
 }
 
+fn parse_compiler_args<'a: 'b, 'b, F>(matches: &'a clap::ArgMatches, f: F) -> Result<(BorrowCalls<'b>, Vec<String>), ParseError<'b>>
+    where F: Fn(Vec<String>) -> (BorrowCalls<'b>, Vec<String>)
+{
+    matches.values_of("args")
+        .map(|args| f(args.map(str::to_string).collect()))
+        .ok_or(gen_error("Compile args are missing").into())
+}
+
 fn parse_input<'a: 'b, 'b>(matches: &'a clap::ArgMatches) -> Result<(BorrowCalls<'b>, Vec<String>), ParseError<'b>> {
     match matches.subcommand() {
         ("bytes", Some(sub_m)) => {
             let offset = try!(sub_m.value_of("offset").unwrap().parse::<u32>());
             let line_start = try!(sub_m.value_of("line_start").unwrap().parse::<u32>());
             let line_end = try!(sub_m.value_of("line_end").unwrap().parse::<u32>());
-            let line = BytePos(line_start)..BytePos(line_end);
-
-            match sub_m.values_of("args") {
-                Some(args) => {
-                    let borrow_calls = BorrowCalls::with_bytes(BytePos(offset), line);
-                    let args = args.map(str::to_string).collect();
-                    Ok((borrow_calls, args))
-                },
-                None => {
-                    Err(gen_error("Compiler args are missing").into())
-                }
-            }
+            parse_compiler_args(sub_m, |args| {
+                let line = BytePos(line_start)..BytePos(line_end);
+                let borrow_calls = BorrowCalls::with_bytes(BytePos(offset), line);
+                (borrow_calls, args)
+            })
         },
         ("line", Some(sub_m)) => {
             let file_name = sub_m.value_of("file_name").unwrap();
-            let line = try!(sub_m.value_of("line").unwrap().parse::<usize>());
-            let column = try!(sub_m.value_of("column").unwrap().parse::<usize>());
-
-            match sub_m.values_of("args") {
-                Some(args) => {
-                    let borrow_calls = BorrowCalls::with_line_info(file_name, line, column);
-                    let args = args.map(str::to_string).collect();
-                    Ok((borrow_calls, args))
-                },
-                None => {
-                    Err(gen_error("Compiler args are missing").into())
-                }
-            }
+            let line = try!(sub_m.value_of("line").unwrap().parse::<u32>());
+            let column = try!(sub_m.value_of("column").unwrap().parse::<u32>());
+            parse_compiler_args(sub_m, |args| {
+                let borrow_calls = BorrowCalls::with_line_info(file_name, line, column);
+                (borrow_calls, args)
+            })
         },
         (cmd, _) => Err(gen_error(format!("Unrecognized subcommand: {}", cmd)).into())
     }
