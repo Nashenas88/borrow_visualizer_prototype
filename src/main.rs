@@ -78,6 +78,19 @@ impl<'a> BorrowCalls<'a> {
             }
         }
     }
+
+    fn print_borrow<'t, 'tcx>(&self, tcx: TyCtxt<'t, 'tcx, 'tcx>, kind_str: &str, span: syntax_pos::Span) -> String {
+        match self.input {
+            InputKind::Bytes(..) => format!("{{\"kind\":\"{}\", \"start\":\"{}\", \"end\":\"{}\"}}",
+                kind_str, span.lo.0, span.hi.0),
+            InputKind::LineInfo(..) => {
+                let loc_start = tcx.sess.codemap().lookup_char_pos(span.lo);
+                let loc_end = tcx.sess.codemap().lookup_char_pos(span.hi);
+                format!("{{\"kind\":\"{}\",\"start\":{{\"line\":{},\"col\":{}}},\"end\":{{\"line\":{},\"col\":{}}}}}",
+                    kind_str, loc_start.line, loc_start.col.0, loc_end.line, loc_end.col.0)
+            }
+        }
+    }
 }
 
 impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
@@ -120,12 +133,21 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
                         ty::BorrowKind::MutBorrow => "mut",
                         ty::BorrowKind::UniqueImmBorrow => "uimm"
                     };
-                    let span = loan.span();
-                    // let gen_span = loan.gen_scope().span(&tcx.region_maps, &tcx.map);
-                    // let kill_span = loan.kill_scope().span(&tcx.region_maps, &tcx.map);
-                    format!("{{\"kind\":\"{}\", \"start\":\"{}\", \"end\":\"{}\"}}",
-                        kind_str, span.lo.0, span.hi.0)
+                    // let span = loan.span();
+                    let gen_span = loan.gen_scope().span(&tcx.region_maps, &tcx.map);
+                    let kill_span = loan.kill_scope().span(&tcx.region_maps, &tcx.map);
+                    match (gen_span, kill_span) {
+                        (Some(gen_span), Some(kill_span)) => {
+                            let borrow_span = syntax_pos::Span{ lo: gen_span.lo, hi: kill_span.hi, expn_id: syntax_pos::NO_EXPANSION };
+                            this.print_borrow(tcx, kind_str, borrow_span)
+                        }
+                        _ => {
+                            debug!("One of gen_span or kill_span does not exist for loan");
+                            "".to_owned()
+                        }
+                    }
                 })
+                .filter(|json_str| json_str != "")
                 .collect::<Vec<_>>()
                 .join(","));
         };
