@@ -20,6 +20,7 @@ use rustc_driver::{driver, CompilerCalls, Compilation};
 use clap::{Arg, App};
 
 use std::ops::Range;
+use std::io::Write;
 
 struct BorrowCalls {
     offset: usize,
@@ -154,6 +155,21 @@ fn parse_nums(matches: &clap::ArgMatches) -> Result<(usize, usize, usize), std::
     Ok((offset, line_start, line_end))
 }
 
+// Takes buffers and never outputs them
+struct BlackHole {}
+
+impl Write for BlackHole {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+unsafe impl Send for BlackHole {}
+
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     // collect the program name ahead of time
@@ -194,5 +210,5 @@ fn main() {
 
     let mut args: Vec<String> = matches.values_of("args").unwrap().map(|s| s.to_string()).collect();
     args.insert(0, prog); // prepend prog back to beginning of args
-    rustc_driver::run_compiler(&args, &mut BorrowCalls::new(offset, line_start..line_end), None, None);
+    rustc_driver::run_compiler(&args, &mut BorrowCalls::new(offset, line_start..line_end), None, Some(box BlackHole{}));
 }
