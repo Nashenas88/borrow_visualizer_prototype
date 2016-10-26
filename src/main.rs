@@ -24,6 +24,7 @@ use std::ops::Range;
 use std::io::Write;
 use std::fmt::Display;
 use std::borrow::Cow;
+use log::{LogRecord, LogLevel, LogMetadata};
 
 #[derive(Clone)]
 enum InputKind<'a> {
@@ -95,24 +96,36 @@ impl<'a> BorrowCalls<'a> {
 
 impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
     fn build_controller(&mut self, _: &Session, _: &getopts::Matches) -> driver::CompileController<'a> {
-        debug!("build controller..");
+        trace!("build controller..");
         let mut control = driver::CompileController::basic();
         control.after_analysis.stop = Compilation::Stop;
 
         // reassign since we can't capture self
         let this = self.clone();
         control.after_analysis.callback = box move |compile_state: &mut driver::CompileState| {
-            let tcx = if let Some(tcx) = compile_state.tcx { tcx } else { debug!("no tcx"); return; };
+            let tcx = if let Some(tcx) = compile_state.tcx {
+                tcx
+            } else {
+                debug!("no tcx");
+                return;
+            };
+
             let (offset, line) = match this.get_byte_info(tcx) {
-                Ok((o, l)) => (o, l),
+                Ok(res) => res,
                 Err(e) => {
                     print_error(format!("{}", e));
                     return;
                 }
             };
 
-            let (node_id, node, fn_like, fn_node) = nodeid_from_offset_and_line(tcx, offset, &line)
-                .expect(&format!("unable to find matching nodeid for offset {} at line {:?}", offset.0, line));
+            let (node_id, node, fn_like, fn_node) = match nodeid_from_offset_and_line(tcx, offset, &line) {
+                Some(res) => res,
+                None => {
+                    debug!("unable to find matching nodeid for offset {} at line {:?}", offset.0, line);
+                    println!("[{{\"kind\":\"notification\",\"message\":\"No analyzable node found\"}}]");
+                    return;
+                }
+            };
 
             let cfg = cfg::CFG::new(tcx, &fn_like.body());
             let (_, analysis_data) = borrowck::build_borrowck_dataflow_data_for_fn(
@@ -120,7 +133,7 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
                 compile_state.mir_map,
                 fn_like.to_fn_parts(),
                 &cfg);
-            debug!("Found {} loans within fn identified by {}:\n{:?}\n{:?}", analysis_data.all_loans.len(), node_id.as_u32(), node, fn_node);
+            debug!("Found {} loans within fn-like identified by {}:\n{:?}\n{:?}", analysis_data.all_loans.len(), node_id.as_u32(), node, fn_node);
 
             // gather and return analysis data when loan internals can be accessed imm
             println!("[{}]", analysis_data.all_loans.iter()
@@ -222,7 +235,8 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: By
 #[derive(Debug)]
 enum ParseError<'a> {
     ParseIntKind(std::num::ParseIntError),
-    StrKind(Cow<'a,str>)
+    StrKind(Cow<'a,str>),
+    SetLoggerError(log::SetLoggerError),
 }
 
 impl<'a> From<std::num::ParseIntError> for ParseError<'a> {
@@ -243,11 +257,18 @@ impl<'a> From<String> for ParseError<'a> {
     }
 }
 
+impl<'a> From<log::SetLoggerError> for ParseError<'a> {
+    fn from(e: log::SetLoggerError) -> Self {
+        ParseError::SetLoggerError(e)
+    }
+}
+
 impl<'a> Display for ParseError<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             &ParseError::ParseIntKind(ref e) => e.fmt(f),
-            &ParseError::StrKind(ref e) => write!(f, "{}", e)
+            &ParseError::StrKind(ref e) => write!(f, "{}", e),
+            &ParseError::SetLoggerError(ref e) => e.fmt(f),
         }
     }
 }
@@ -266,6 +287,17 @@ fn parse_input<'a: 'b, 'b>(matches: &'a clap::ArgMatches) -> Result<(BorrowCalls
             let offset = try!(sub_m.value_of("offset").unwrap().parse::<u32>());
             let line_start = try!(sub_m.value_of("line_start").unwrap().parse::<u32>());
             let line_end = try!(sub_m.value_of("line_end").unwrap().parse::<u32>());
+            if let Some(output) = sub_m.value_of("log_out") {
+                try!(log::set_logger(move |_| {
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .open(output);
+                    box SimpleFileLogger::new(file.unwrap())
+                }));
+            }
+
             parse_compiler_args(sub_m, |args| {
                 let line = BytePos(line_start)..BytePos(line_end);
                 let borrow_calls = BorrowCalls::with_bytes(BytePos(offset), line);
@@ -276,6 +308,18 @@ fn parse_input<'a: 'b, 'b>(matches: &'a clap::ArgMatches) -> Result<(BorrowCalls
             let file_name = sub_m.value_of("file_name").unwrap();
             let line = try!(sub_m.value_of("line").unwrap().parse::<u32>());
             let column = try!(sub_m.value_of("column").unwrap().parse::<u32>());
+            if let Some(output) = sub_m.value_of("log_out") {
+                try!(log::set_logger(move |max_log_level| {
+                    max_log_level.set(log::LogLevelFilter::Debug);
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .append(true)
+                        .create(true)
+                        .open(output);
+                    box SimpleFileLogger::new(file.unwrap())
+                }));
+            }
+
             parse_compiler_args(sub_m, |args| {
                 let borrow_calls = BorrowCalls::with_line_info(file_name, line, column);
                 (borrow_calls, args)
@@ -313,20 +357,25 @@ fn get_matches<'a>() -> clap::ArgMatches<'a> {
         .about("Poorly finds borrow spans")
         .subcommand(extend_args(SubCommand::with_name("bytes")
             .arg(Arg::with_name("offset")
-                    .value_name("OFFSET_BYTES")
-                    .help("The number of bytes from the start of the file to the item to analyze.")
-                    .takes_value(true)
-                    .required(true))
+                .value_name("OFFSET_BYTES")
+                .help("The number of bytes from the start of the file to the item to analyze.")
+                .takes_value(true)
+                .required(true))
             .arg(Arg::with_name("line_start")
-                    .value_name("LINE_START_BYTES")
-                    .help("The number of bytes from the start of the file to the start of the line of the item to analyze.")
-                    .takes_value(true)
-                    .required(true))
+                .value_name("LINE_START_BYTES")
+                .help("The number of bytes from the start of the file to the start of the line of the item to analyze.")
+                .takes_value(true)
+                .required(true))
             .arg(Arg::with_name("line_end")
-                    .value_name("LINE_END_BYTES")
-                    .help("The number of bytes from the start of the file to the end of the line of the item to anaylize.")
-                    .takes_value(true)
-                    .required(true))))
+                .value_name("LINE_END_BYTES")
+                .help("The number of bytes from the start of the file to the end of the line of the item to anaylize.")
+                .takes_value(true)
+                .required(true))
+            .arg(Arg::with_name("log_out")
+                .value_name("OUTPUT_FILE")
+                .help("The file to write logs to.")
+                .takes_value(true)
+                .required(false))))
         .subcommand(extend_args(SubCommand::with_name("line")
             .arg(Arg::with_name("file_name")
                 .value_name("FILE_NAME")
@@ -342,17 +391,49 @@ fn get_matches<'a>() -> clap::ArgMatches<'a> {
                 .value_name("COLUMN_NUMBER")
                 .help("The column number for the item to analyze.")
                 .takes_value(true)
-                .required(true))))
+                .required(true))
+            .arg(Arg::with_name("log_out")
+                .value_name("OUTPUT_FILE")
+                .help("The file to write logs to.")
+                .takes_value(true)
+                .required(false))))
         .get_matches()
 }
 
 fn gen_error<'a, T>(message: T) -> String where T: Into<Cow<'a, str>> {
     let message = message.into().to_owned().escape_default();
-    format!("[{{\"error\":\"{}\"}}]", message)
+    format!("[{{\"kind\":\"error\",\"error\":\"{}\"}}]", message)
 }
 
 fn print_error<'a, T>(message: T) where T: Into<Cow<'a, str>> {
     println!("{}", gen_error(message));
+}
+
+struct SimpleFileLogger {
+    file: std::sync::Mutex<std::cell::RefCell<std::fs::File>>
+}
+
+impl SimpleFileLogger {
+    fn new(file: std::fs::File) -> Self {
+        SimpleFileLogger { file: std::sync::Mutex::new(std::cell::RefCell::new(file)) }
+    }
+}
+
+impl log::Log for SimpleFileLogger {
+    fn enabled(&self, metadata: &LogMetadata) -> bool {
+        metadata.level() <= LogLevel::Debug
+    }
+
+    fn log(&self, record: &LogRecord) {
+        if self.enabled(record.metadata()) {
+            let file = self.file.lock().unwrap();
+            if let Err(e) = write!(file.borrow_mut(), "{}\n", record.args()) {
+                if let Err(e) = write!(std::io::stderr(), "Failed to write to log file: {}", e) {
+                    panic!("Something went horribly, horribly wrong: {}", e);
+                }
+            };
+        }
+    }
 }
 
 fn main() {

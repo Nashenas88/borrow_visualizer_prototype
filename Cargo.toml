@@ -5,3 +5,4 @@ authors = ["Paul Faria <Nashenas88@gmail.com>"]
 
 [dependencies]
 clap = "2.14"
+log = "0.3"
