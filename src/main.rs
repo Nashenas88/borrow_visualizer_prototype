@@ -3,7 +3,8 @@
 extern crate getopts;
 extern crate rustc;
 extern crate rustc_driver;
-extern crate rustc_borrowck;
+extern crate rustc_borrowck as borrowck;
+extern crate rustc_errors as errors;
 extern crate syntax;
 extern crate syntax_pos;
 extern crate clap;
@@ -15,7 +16,8 @@ use rustc::session::Session;
 use rustc::ty::{self, TyCtxt};
 use rustc::hir::map as hir_map;
 use rustc::hir::map::blocks;
-use rustc_borrowck as borrowck;
+// use borrowck::{AnalysisData, Loan, LoanPath};
+// use borrowck::move_data;
 use rustc_driver::{driver, CompilerCalls, Compilation};
 use clap::{Arg, App, SubCommand};
 use syntax_pos::BytePos;
@@ -25,6 +27,10 @@ use std::io::Write;
 use std::fmt::Display;
 use std::borrow::Cow;
 use log::{LogRecord, LogLevel, LogMetadata};
+
+use std::path::PathBuf;
+use rustc::session::config::{self, Input};
+use syntax::ast;
 
 #[derive(Clone)]
 enum InputKind<'a> {
@@ -95,6 +101,18 @@ impl<'a> BorrowCalls<'a> {
 }
 
 impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
+    fn no_input(&mut self,
+                _: &getopts::Matches,
+                _: &config::Options,
+                _: &ast::CrateConfig,
+                _: &Option<PathBuf>,
+                _: &Option<PathBuf>,
+                _: &errors::registry::Registry)
+                -> Option<(Input, Option<PathBuf>)> {
+        println!("No input :(");
+        None
+    }
+
     fn build_controller(&mut self, _: &Session, _: &getopts::Matches) -> driver::CompileController<'a> {
         trace!("build controller..");
         let mut control = driver::CompileController::basic();
@@ -127,19 +145,19 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
                 }
             };
 
-            let cfg = cfg::CFG::new(tcx, &fn_like.body());
+            let body = tcx.hir.krate().body(fn_like.body());
+            let cfg = cfg::CFG::new(tcx, &body.value);
             let (_, analysis_data) = borrowck::build_borrowck_dataflow_data_for_fn(
                 tcx,
-                compile_state.mir_map,
-                fn_like.to_fn_parts(),
+                fn_like.body(),
                 &cfg);
             debug!("Found {} loans within fn-like identified by {}:\n{:?}\n{:?}", analysis_data.all_loans.len(), node_id.as_u32(), node, fn_node);
 
             // gather and return analysis data when loan internals can be accessed imm
             println!("[{}]", analysis_data.all_loans.iter()
                 // we only care abouts loans related to our target
-                .filter(|&loan| loan.loan_path().belongs_to(node_id))
-                .map(|loan| {
+                .filter(|&loan| (*loan.loan_path()).belongs_to(node_id))
+                .filter_map(|loan| {
                     debug!("{:?}", loan);
                     let kind_str = match loan.kind() {
                         ty::BorrowKind::ImmBorrow => "imm",
@@ -147,20 +165,42 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
                         ty::BorrowKind::UniqueImmBorrow => "uimm"
                     };
                     // let span = loan.span();
-                    let gen_span = loan.gen_scope().span(&tcx.region_maps, &tcx.map);
-                    let kill_span = loan.kill_scope().span(&tcx.region_maps, &tcx.map);
+                    let gen_span = loan.gen_scope().span(&tcx.region_maps, &tcx.hir);
+                    let kill_span = loan.kill_scope().span(&tcx.region_maps, &tcx.hir);
                     match (gen_span, kill_span) {
                         (Some(gen_span), Some(kill_span)) => {
                             let borrow_span = syntax_pos::Span{ lo: gen_span.lo, hi: kill_span.hi, expn_id: syntax_pos::NO_EXPANSION };
-                            this.print_borrow(tcx, kind_str, borrow_span)
+                            Some(this.print_borrow(tcx, kind_str, borrow_span))
                         }
                         _ => {
                             debug!("One of gen_span or kill_span does not exist for loan");
-                            "".to_owned()
+                            None
                         }
                     }
                 })
-                .filter(|json_str| json_str != "")
+                .chain(analysis_data.move_data.move_data.moves.borrow().iter()
+                    .filter(|m| analysis_data.move_data.move_data.path_loan_path(m.path).belongs_to(node_id))
+                    .map(|m| {
+                        let move_span = tcx.hir.span(m.id);
+                        this.print_borrow(tcx, "mov", move_span)
+                    }))
+                .chain(analysis_data.move_data.move_data.var_assignments.borrow().iter()
+                    .filter(|a| a.assignee_id == node_id)
+                    .filter_map(|a| {
+                        let path = analysis_data.move_data.move_data.path_loan_path(a.path);
+                        let gen_span = tcx.hir.span(node_id);
+                        let kill_span = path.kill_scope(tcx).span(&tcx.region_maps, &tcx.hir);
+                        match (gen_span, kill_span) {
+                            (gen_span, Some(kill_span)) => {
+                                let borrow_span = syntax_pos::Span{ lo: gen_span.lo, hi: kill_span.hi, expn_id: syntax_pos::NO_EXPANSION };
+                                Some(this.print_borrow(tcx, "live", borrow_span))
+                            }
+                            _ => {
+                                debug!("One of gen_span or kill_span does not exist for var");
+                                None
+                            }
+                        }
+                    }))
                 .collect::<Vec<_>>()
                 .join(","));
         };
@@ -171,18 +211,45 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
 
 fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: BytePos, line: &Range<BytePos>)
         -> Option<(syntax::ast::NodeId, hir_map::Node<'tcx>, blocks::FnLikeNode<'tcx>, hir_map::Node<'tcx>)> {
-    for (&id, _) in tcx.node_types().iter() {
-        let node = if let Some(node) = tcx.map.find(id) {
-            node
-        } else {
-            continue;
+    debug!("Searching for node");
+    for def_id in tcx.tables.borrow().keys() {
+        let tables = tcx.tables.borrow(); // satisfy borrow checker
+        let entry = tables.get(&def_id).unwrap();
+        let def_span = match tcx.hir.span_if_local(def_id) {
+            Some(sp) => sp,
+            None => continue,
         };
-        // Avoid statements, they're always ().
-        if let hir_map::NodeStmt(_) = node {
+
+        if def_span.expn_id != syntax_pos::NO_EXPANSION {
             continue;
         }
 
-        if let Some(sp) = tcx.map.opt_span(id) {
+        let (lo, hi) = (def_span.lo.0 as u32, def_span.hi.0 as u32);
+        // may fail if we don't take offset into account, e.g. def starts in the middle of the line
+        if !(lo <= offset.0 && offset.0 <= hi) {
+            // The line we're looking for is not in this def
+            continue;
+        }
+
+        debug!("Found potential matching def! {:?}", def_id);
+        debug!("Def Span: {}-{}", lo, hi);
+        debug!("Cursor: {}", offset.0);
+
+        for (&id, _) in entry.node_types.iter() {
+            debug!("id: {} => ", id);
+            let node = if let Some(node) = tcx.hir.find(id) {
+                node
+            } else {
+                debug!("None");
+                continue;
+            };
+
+            // the important parts exists as other nodes
+            if let hir_map::NodeStmt(..) = node {
+                continue;
+            }
+
+            let sp = tcx.hir.span(id);
             // Avoid peeking at macro expansions.
             if sp.expn_id != syntax_pos::NO_EXPANSION {
                 continue;
@@ -201,27 +268,27 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: By
                     // TODO Needs to be narrowed down more
                     _ => {
                         let mut old_id = id;
-                        let mut parent_id = tcx.map.get_parent_node(id);
+                        let mut parent_id = tcx.hir.get_parent_node(id);
                         loop {
                             if parent_id == old_id {
                                 // reached the root
                                 continue;
                             }
 
-                            let parent_node = if let Some(node) = tcx.map.find(parent_id) {
+                            let parent_node = if let Some(node) = tcx.hir.find(parent_id) {
                                 node
                             } else {
                                 // unable to find node
                                 continue;
                             };
 
-                            let code = blocks::Code::from_node(parent_node);
-                            if let Some(blocks::FnLikeCode(fn_like)) = code {
+                            let code = blocks::Code::from_node(&tcx.hir, parent_id);
+                            if let Some(blocks::Code::FnLike(fn_like)) = code {
                                 return Some((id, node, fn_like, parent_node));
                             } else {
                                 // we need to jump higher
                                 old_id = parent_id;
-                                parent_id = tcx.map.get_parent_node(old_id);
+                                parent_id = tcx.hir.get_parent_node(old_id);
                             }
                         }
                     }
@@ -274,7 +341,7 @@ impl<'a> Display for ParseError<'a> {
 }
 
 fn parse_compiler_args<'a: 'b, 'b, F>(matches: &'a clap::ArgMatches, f: F) -> Result<(BorrowCalls<'b>, Vec<String>), ParseError<'b>>
-    where F: Fn(Vec<String>) -> (BorrowCalls<'b>, Vec<String>)
+    where F: FnOnce(Vec<String>) -> (BorrowCalls<'b>, Vec<String>)
 {
     matches.values_of("args")
         .map(|args| f(args.map(str::to_string).collect()))
@@ -320,8 +387,9 @@ fn parse_input<'a: 'b, 'b>(matches: &'a clap::ArgMatches) -> Result<(BorrowCalls
                 }));
             }
 
-            parse_compiler_args(sub_m, |args| {
+            parse_compiler_args(sub_m, |mut args| {
                 let borrow_calls = BorrowCalls::with_line_info(file_name, line, column);
+                args.push(file_name.to_owned());
                 (borrow_calls, args)
             })
         },
@@ -346,8 +414,7 @@ impl Write for BlackHole {
 unsafe impl Send for BlackHole {}
 
 fn extend_args<'a>(app: App<'a, 'a>) -> App<'a, 'a> {
-    app.setting(clap::AppSettings::TrailingVarArg)
-        .arg(Arg::from_usage("<args>... 'arguments to pass to the compiler.'"))
+    app.arg_from_usage("[args]... 'Arguments to pass to the compiler'")
 }
 
 fn get_matches<'a>() -> clap::ArgMatches<'a> {
