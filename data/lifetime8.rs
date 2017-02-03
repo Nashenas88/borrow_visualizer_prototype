@@ -1,6 +1,7 @@
 #[derive(Debug)]
 struct Foo;
 
+#[derive(Debug)]
 struct Bar<'b> {
     f: Option<&'b str>
 }
@@ -69,6 +70,8 @@ fn main() {
     }
     move_f(message);
     drop(x);
+    move_f(message);
     let y = x*3;
     let f2 = b_target.unclear_method_name();
+    println!("b_target: {}", b_target);
 }

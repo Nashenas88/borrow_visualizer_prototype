@@ -140,7 +140,7 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
                 Some(res) => res,
                 None => {
                     debug!("unable to find matching nodeid for offset {} at line {:?}", offset.0, line);
-                    println!("[{{\"kind\":\"notification\",\"message\":\"No analyzable node found\"}}]");
+                    println!("[]");
                     return;
                 }
             };
@@ -153,6 +153,18 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
                 &cfg);
             debug!("Found {} loans within fn-like identified by {}:\n{:?}\n{:?}", analysis_data.all_loans.len(), node_id.as_u32(), node, fn_node);
 
+            // In a succesful compilation, `moves` will have 0 or 1 elements. Fortunately,
+            // we work with failing compilations too, so it's important that we limit
+            // the highlighting of the "live" span to the end of the first move. The goal
+            // is to help the user more easily realize that the second move is impossible
+            // without the variable being in scope.
+            let move_data_moves = analysis_data.move_data.move_data.moves.borrow();
+            let moves: Vec<_> = move_data_moves.iter()
+                .filter(|m| analysis_data.move_data.move_data.path_loan_path(m.path).belongs_to(node_id))
+                .map(|m| tcx.hir.span(m.id))
+                .collect();
+            let first_move = moves.iter().cloned().min_by_key(|m| m.lo.0);
+
             // gather and return analysis data when loan internals can be accessed imm
             println!("[{}]", analysis_data.all_loans.iter()
                 // we only care abouts loans related to our target
@@ -164,41 +176,54 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
                         ty::BorrowKind::MutBorrow => "mut",
                         ty::BorrowKind::UniqueImmBorrow => "uimm"
                     };
-                    // let span = loan.span();
-                    let gen_span = loan.gen_scope().span(&tcx.region_maps, &tcx.hir);
-                    let kill_span = loan.kill_scope().span(&tcx.region_maps, &tcx.hir);
-                    match (gen_span, kill_span) {
-                        (Some(gen_span), Some(kill_span)) => {
-                            let borrow_span = syntax_pos::Span{ lo: gen_span.lo, hi: kill_span.hi, expn_id: syntax_pos::NO_EXPANSION };
-                            Some(this.print_borrow(tcx, kind_str, borrow_span))
-                        }
-                        _ => {
-                            debug!("One of gen_span or kill_span does not exist for loan");
-                            None
-                        }
+
+                    // FIXME: do we need this -> let span = loan.span();
+
+                    // Make sure to get the unexpanded span, otherwise we'll
+                    // the span of the macro definition in another file! This
+                    // leads to some obviously (though it more rarely might not be)
+                    // incorrect spans;
+                    let gen_span = loan.gen_scope()
+                        .span(&tcx.region_maps, &tcx.hir)
+                        .map(|s| get_unexpanded_span(s, &tcx));
+                    let kill_span = loan.kill_scope()
+                        .span(&tcx.region_maps, &tcx.hir)
+                        .map(|s| get_unexpanded_span(s, &tcx));
+
+                    if let (Some(gen_span), Some(kill_span)) = (gen_span, kill_span) {
+                        let borrow_span = syntax_pos::Span{
+                            lo: gen_span.lo,
+                            hi: kill_span.hi,
+                            expn_id: syntax_pos::NO_EXPANSION
+                        };
+                        Some(this.print_borrow(tcx, kind_str, borrow_span))
+                    } else {
+                        debug!("One of gen_span or kill_span does not exist for loan");
+                        None
                     }
                 })
-                .chain(analysis_data.move_data.move_data.moves.borrow().iter()
-                    .filter(|m| analysis_data.move_data.move_data.path_loan_path(m.path).belongs_to(node_id))
-                    .map(|m| {
-                        let move_span = tcx.hir.span(m.id);
-                        this.print_borrow(tcx, "mov", move_span)
-                    }))
+                .chain(moves.iter().map(|move_span| this.print_borrow(tcx, "mov", *move_span)))
                 .chain(analysis_data.move_data.move_data.var_assignments.borrow().iter()
                     .filter(|a| a.assignee_id == node_id)
                     .filter_map(|a| {
+                        // we may want to visualiza a.span in some way
                         let path = analysis_data.move_data.move_data.path_loan_path(a.path);
-                        let gen_span = tcx.hir.span(node_id);
                         let kill_span = path.kill_scope(tcx).span(&tcx.region_maps, &tcx.hir);
-                        match (gen_span, kill_span) {
-                            (gen_span, Some(kill_span)) => {
-                                let borrow_span = syntax_pos::Span{ lo: gen_span.lo, hi: kill_span.hi, expn_id: syntax_pos::NO_EXPANSION };
-                                Some(this.print_borrow(tcx, "live", borrow_span))
-                            }
-                            _ => {
-                                debug!("One of gen_span or kill_span does not exist for var");
-                                None
-                            }
+                        if let Some(kill_span) = kill_span {
+                            // If there's a move span, then we limit the "live" span to the end
+                            // of the move span. This shows that the variable's "scope" has
+                            // ended at this point. Any usages (reads, writes, borrows, moves)
+                            // can still be visualized, but should match with compiler errors.
+                            let hi = if let Some(move_span) = first_move {
+                                move_span.hi
+                            } else {
+                                kill_span.hi
+                            };
+                            let live_span = syntax_pos::Span{ lo: kill_span.lo, hi: hi, expn_id: syntax_pos::NO_EXPANSION };
+                            Some(this.print_borrow(tcx, "live", live_span))
+                        } else {
+                            debug!("kill_span does not exist for var");
+                            None
                         }
                     }))
                 .collect::<Vec<_>>()
@@ -207,6 +232,22 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
 
         control
     }
+}
+
+fn get_unexpanded_span<'a, 'tcx>(input_span: syntax_pos::Span, tcx: &TyCtxt<'a, 'tcx, 'tcx>) -> syntax_pos::Span {
+    let cm = tcx.sess.codemap();
+    // Walk up the macro expansion chain until we reach a non-expanded span.
+    let mut span = input_span;
+    while span.expn_id != syntax_pos::NO_EXPANSION && span.expn_id != syntax_pos::COMMAND_LINE_EXPN {
+        if let Some(callsite_span) = cm.with_expn_info(span.expn_id,
+                                            |ei| ei.map(|ei| ei.call_site.clone())) {
+            span = callsite_span;
+        } else {
+            break;
+        }
+    }
+
+    span
 }
 
 fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: BytePos, line: &Range<BytePos>)
@@ -256,7 +297,8 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: By
             }
 
             let (lo, hi) = (sp.lo.0 as u32, sp.hi.0 as u32);
-            if line.start.0 <= lo && lo <= offset.0 && offset.0 <= hi && hi <= line.end.0 {
+            if line.start.0 <= lo && lo <= offset.0
+                    && offset.0 <= hi && hi <= line.end.0 {
                 debug!("Looking at nodeid {}", id.as_u32());
                 debug!("lo: {}, hi: {}", lo, hi);
                 debug!("found matching block: {:?}", node);
