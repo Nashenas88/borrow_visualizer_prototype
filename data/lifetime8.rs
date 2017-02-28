@@ -53,6 +53,16 @@ fn main() {
     }
     borrow(&mut target3);
 
+    if let Some(x) = Some("abc123") {
+        let v = &x.chars();
+        println!("{:?}", v);
+    }
+
+    match Some("123456") {
+        Some(x) => println!("{}", x),
+        None => println!("Noting"),
+    }
+
     let mut b_target = Bar { f: Some("123") };
     let f = b_target.unclear_method_name();
     let g = b_target.unclear_method_name();
@@ -73,5 +83,5 @@ fn main() {
     move_f(message);
     let y = x*3;
     let f2 = b_target.unclear_method_name();
-    println!("b_target: {}", b_target);
+    println!("b_target: {:?}", b_target);
 }
