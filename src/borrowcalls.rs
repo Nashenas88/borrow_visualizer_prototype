@@ -131,7 +131,7 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
             };
 
             let body = tcx.hir.krate().body(fn_like.body());
-            let cfg = cfg::CFG::new(tcx, &body.value);
+            let cfg = cfg::CFG::new(tcx, &body);
             let (_, analysis_data) = borrowck::build_borrowck_dataflow_data_for_fn(
                 tcx,
                 fn_like.body(),
@@ -248,8 +248,8 @@ fn get_unexpanded_span<'a, 'tcx>(input_span: syntax_pos::Span, tcx: &TyCtxt<'a, 
 fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: BytePos, line: &Range<BytePos>)
         -> Option<(syntax::ast::NodeId, Option<hir_map::Node<'tcx>>, blocks::FnLikeNode<'tcx>, hir_map::Node<'tcx>)> {
     debug!("Searching for node");
-    for def_id in tcx.tables.borrow().keys() {
-        let tables = tcx.tables.borrow(); // satisfy borrow checker
+    for def_id in tcx.maps.typeck_tables.borrow().keys() {
+        let tables = tcx.maps.typeck_tables.borrow();
         let entry = tables.get(&def_id).unwrap();
         let def_span = match tcx.hir.span_if_local(def_id) {
             Some(sp) => sp,
@@ -260,15 +260,13 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: By
             continue;
         }
 
-        let (lo, hi) = (def_span.lo.0 as u32, def_span.hi.0 as u32);
-        // may fail if we don't take offset into account, e.g. def starts in the middle of the line
-        if !(lo <= offset.0 && offset.0 <= hi) {
+        if !within_span(def_span, offset, line) {
             // The line we're looking for is not in this def
             continue;
         }
 
         debug!("Found potential matching def! {:?}", def_id);
-        debug!("Def Span: {}-{}", lo, hi);
+        debug!("Def Span: {:?}", def_span);
         debug!("Cursor: {}", offset.0);
 
         for (&id, _) in entry.node_types.iter() {
@@ -296,7 +294,6 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: By
             }
 
             debug!("Looking at nodeid {}", id.as_u32());
-            debug!("lo: {}, hi: {}", lo, hi);
             debug!("found matching block: {:?}", node);
             match node {
                 // These cannot be reliably printed.
