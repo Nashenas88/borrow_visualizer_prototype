@@ -260,7 +260,7 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: By
             continue;
         }
 
-        if !within_span(def_span, offset, line) {
+        if !within_def_span(def_span, offset) {
             // The line we're looking for is not in this def
             continue;
         }
@@ -366,6 +366,11 @@ fn within_span(span: Span, offset: BytePos, line: &Range<BytePos>) -> bool {
     let (lo, hi) = (span.lo.0 as u32, span.hi.0 as u32);
     line.start.0 <= lo && lo <= offset.0
         && offset.0 <= hi && hi <= line.end.0
+}
+
+fn within_def_span(span: Span, offset: BytePos) -> bool {
+    let (lo, hi) = (span.lo.0 as u32, span.hi.0 as u32);
+    lo <= offset.0 && offset.0 <= hi
 }
 
 fn filter_pattern(pat: &hir::Pat, offset: BytePos, line: &Range<BytePos>) -> Option<hir::def_id::DefId> {
