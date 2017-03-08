@@ -141,8 +141,7 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
             // In a succesful compilation, `moves` will have 0 or 1 elements. Fortunately,
             // we work with failing compilations too, so it's important that we limit
             // the highlighting of the "live" span to the end of the first move. The goal
-            // is to help the user more easily realize that the second move is impossible
-            // without the variable being in scope.
+            // is to help the user more easily realize that the second move is impossible.
             let move_data = analysis_data.move_data.move_data;
             let move_data_moves = move_data.moves.borrow();
             let mut moves: Vec<_> = move_data_moves.iter()
@@ -195,10 +194,10 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
                         // incorrect spans;
                         let gen_span = loan.gen_scope()
                             .span(&tcx.region_maps, &tcx.hir)
-                            .map(|s| get_unexpanded_span(s, &tcx));
+                            .and_then(|s| get_unexpanded_span(s, &tcx));
                         let kill_span = loan.kill_scope()
                             .span(&tcx.region_maps, &tcx.hir)
-                            .map(|s| get_unexpanded_span(s, &tcx));
+                            .and_then(|s| get_unexpanded_span(s, &tcx));
 
                         if let (Some(gen_span), Some(kill_span)) = (gen_span, kill_span) {
                             let borrow_span = syntax_pos::Span{
@@ -229,7 +228,7 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
     }
 }
 
-fn get_unexpanded_span<'a, 'tcx>(input_span: syntax_pos::Span, tcx: &TyCtxt<'a, 'tcx, 'tcx>) -> syntax_pos::Span {
+fn get_unexpanded_span<'a, 'tcx>(input_span: syntax_pos::Span, tcx: &TyCtxt<'a, 'tcx, 'tcx>) -> Option<syntax_pos::Span> {
     let cm = tcx.sess.codemap();
     // Walk up the macro expansion chain until we reach a non-expanded span.
     let mut span = input_span;
@@ -238,11 +237,13 @@ fn get_unexpanded_span<'a, 'tcx>(input_span: syntax_pos::Span, tcx: &TyCtxt<'a, 
                                             |ei| ei.map(|ei| ei.call_site.clone())) {
             span = callsite_span;
         } else {
-            break;
+            // There are no unexpanded spans, so we can't generate a span
+            // for the current file.
+            return None;
         }
     }
 
-    span
+    Some(span)
 }
 
 fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: BytePos, line: &Range<BytePos>)
