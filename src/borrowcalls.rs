@@ -145,15 +145,29 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
             let move_data = analysis_data.move_data.move_data;
             let move_data_moves = move_data.moves.borrow();
             let mut moves: Vec<_> = move_data_moves.iter()
-                .filter(|m| move_data.path_loan_path(m.path).belongs_to(node_id))
+                .filter(|m| {
+                    debug!("Potential move: {:?}-{:?}", m.id, m.kind);
+                    move_data.path_loan_path(m.path).belongs_to(node_id)
+                })
                 .map(|m| tcx.hir.span(m.id))
                 .collect();
             moves.sort();
             let first_move = if moves.len() > 0 { Some(moves[0]) } else { None };
 
+            for pa in move_data.path_assignments.borrow().iter() {
+                debug!("Potential path assignment: {:?}-({:?},{:?})-{:?}", tcx.hir.find(pa.id), pa.span.lo, pa.span.hi, tcx.hir.find(pa.assignee_id));
+            }
+
+            for vm in move_data.variant_matches.borrow().iter() {
+                debug!("Potential variant match: {:?}-{:?}", tcx.hir.find(vm.id), vm.mode);
+            }
+
             // gather and return analysis data when loan internals can be accessed imm
             let mut regions = move_data.var_assignments.borrow().iter()
-                .filter(|a| a.assignee_id == node_id)
+                .filter(|a| {
+                    debug!("Potential var_assignment: {:?}-({:?},{:?})-{:?}", tcx.hir.find(a.id), a.span.lo, a.span.hi, tcx.hir.find(a.assignee_id));
+                    a.assignee_id == node_id
+                })
                 .filter_map(|a| {
                     // we may want to visualiza a.span in some way
                     let path = move_data.path_loan_path(a.path);
@@ -175,11 +189,47 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
                         None
                     }
                 })
+                .chain(analysis_data.safe_loans.iter()
+                    .filter_map(|ref sl| {
+                        let loan_scope = sl.load_scope();
+                        let borrow_node_id = tcx.region_maps.code_extent_data(loan_scope).node_id();
+                        let borrow_node = tcx.hir.find(borrow_node_id);
+                        let borrow_node = match borrow_node {
+                            Some(node) => node,
+                            _ => return None,
+                        };
+
+                        if let hir_map::NodeExpr(expr) = borrow_node {
+                            if !expr_borrows_node_id(&tcx, node_id, expr) {
+                                return None;
+                            }
+
+                            let kind = match sl.kind() {
+                                ty::BorrowKind::ImmBorrow => Kind::Immutable,
+                                ty::BorrowKind::MutBorrow => Kind::Mutable,
+                                ty::BorrowKind::UniqueImmBorrow => Kind::UniqueImmutable,
+                            };
+
+                            let loan_span = loan_scope
+                                .span(&tcx.region_maps, &tcx.hir)
+                                .and_then(|s| get_unexpanded_span(s, &tcx));
+                            let loan_span = match loan_span {
+                                Some(span) => span,
+                                None => return None,
+                            };
+                            return Some(region_constructor(tcx, kind, loan_span));
+                        }
+
+                        None
+                    }))
                 .chain(analysis_data.all_loans.iter()
                     // we only care abouts loans related to our target
-                    .filter(|&loan| (*loan.loan_path()).belongs_to(node_id))
+                    .filter(|&loan| {
+                        debug!("Potential: {:?}", loan);
+                        (*loan.loan_path()).belongs_to(node_id)
+                    })
                     .filter_map(|loan| {
-                        debug!("{:?}", loan);
+                        debug!("hit");
                         let kind = match loan.kind() {
                             ty::BorrowKind::ImmBorrow => Kind::Immutable,
                             ty::BorrowKind::MutBorrow => Kind::Mutable,
@@ -228,6 +278,37 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
     }
 }
 
+fn expr_borrows_node_id<'a, 'tcx>(tcx: &TyCtxt<'a, 'tcx, 'tcx>, id: ast::NodeId, expr: &hir::Expr) -> bool {
+    debug!("Expr: {:?}\nExpr.node: {:?}", expr, expr.node);
+    match expr.node {
+        // Here we should be ok since we only check paths, we're
+        // verifying we only support paths to our node_id or
+        // addresses of (address of ...) paths to our node_id.
+        // If more case are added, then this logic may need to change
+        // to account for that. I don't think we need to account for
+        // others at this time.
+        hir::Expr_::ExprAddrOf(_, ref e) => {
+            expr_borrows_node_id(tcx, id, &*e)
+        },
+        hir::Expr_::ExprPath(hir::QPath::Resolved(_, ref path)) => {
+            match path.def {
+                hir::def::Def::Local(def_id) |
+                hir::def::Def::Upvar(def_id, ..) => {
+                    if let Some(node_id) = tcx.hir.as_local_node_id(def_id) {
+                        if node_id == id {
+                            return true;
+                        }
+                    }
+
+                    false
+                },
+                _ => false,
+            }
+        },
+        _ => false,
+    }
+}
+
 fn get_unexpanded_span<'a, 'tcx>(input_span: syntax_pos::Span, tcx: &TyCtxt<'a, 'tcx, 'tcx>) -> Option<syntax_pos::Span> {
     let cm = tcx.sess.codemap();
     // Walk up the macro expansion chain until we reach a non-expanded span.
@@ -271,11 +352,9 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: By
         debug!("Cursor: {}", offset.0);
 
         for (&id, _) in entry.node_types.iter() {
-            debug!("id: {} => ", id);
             let node = if let Some(node) = tcx.hir.find(id) {
                 node
             } else {
-                debug!("None");
                 continue;
             };
 
@@ -294,13 +373,18 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: By
                 continue;
             }
 
-            debug!("Looking at nodeid {}", id.as_u32());
             debug!("found matching block: {:?}", node);
             match node {
                 // These cannot be reliably printed.
                 // hir_map::NodeLocal(_) | hir_map::NodeStructCtor(_) => continue,
                 // There is an associated NodeExpr(ExprBlock) where this actually matters.
                 hir_map::NodeBlock(_) => continue,
+                hir_map::NodeLocal(_) => {
+                    debug!("Local");
+                    if let tup @ Some(..) = get_fn_node(tcx, id, Some(node)) {
+                        return tup;
+                    }
+                },
                 hir_map::NodePat(ref pat) => {
                     let def_id = filter_pattern(pat, offset, line);
                     if def_id.is_none() {
