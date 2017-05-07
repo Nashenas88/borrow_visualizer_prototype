@@ -121,7 +121,7 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
                 }
             };
 
-            let (node_id, node, fn_like, fn_node) = match nodeid_from_offset_and_line(tcx, offset, &line) {
+            let (node_id, node, fn_like, fn_node, fn_id) = match nodeid_from_offset_and_line(tcx, offset, &line) {
                 Some(res) => res,
                 None => {
                     debug!("unable to find matching nodeid for offset {} at line {:?}", offset.0, line);
@@ -130,9 +130,11 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
                 }
             };
 
+            let fn_span = tcx.hir.span(fn_id);
+
             let body = tcx.hir.krate().body(fn_like.body());
             let cfg = cfg::CFG::new(tcx, &body);
-            let (_, analysis_data) = borrowck::build_borrowck_dataflow_data_for_fn(
+            let (bccx, analysis_data) = borrowck::build_borrowck_dataflow_data_for_fn(
                 tcx,
                 fn_like.body(),
                 &cfg);
@@ -171,7 +173,7 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
                 .filter_map(|a| {
                     // we may want to visualiza a.span in some way
                     let path = move_data.path_loan_path(a.path);
-                    let kill_span = path.kill_scope(tcx).span(&tcx.region_maps, &tcx.hir);
+                    let kill_span = path.kill_scope(&bccx).span(&tcx.hir);
                     if let Some(kill_span) = kill_span {
                         // If there's a move span, then we limit the "live" span to the end
                         // of the move span. This shows that the variable's "scope" has
@@ -182,7 +184,7 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
                         } else {
                             kill_span.hi
                         };
-                        let live_span = Span{ lo: kill_span.lo, hi: hi, expn_id: syntax_pos::NO_EXPANSION };
+                        let live_span = Span{ lo: kill_span.lo, hi: hi, ctxt: syntax_pos::NO_EXPANSION };
                         Some(region_constructor(tcx, Kind::Live, live_span))
                     } else {
                         debug!("kill_span does not exist for var");
@@ -191,16 +193,15 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
                 })
                 .chain(analysis_data.safe_loans.iter()
                     .filter_map(|ref sl| {
-                        let loan_scope = sl.load_scope();
-                        let borrow_node_id = tcx.region_maps.code_extent_data(loan_scope).node_id();
-                        let borrow_node = tcx.hir.find(borrow_node_id);
+                        let loan_scope = sl.loan_scope();
+                        let borrow_node = tcx.hir.find(loan_scope.node_id());
                         let borrow_node = match borrow_node {
                             Some(node) => node,
                             _ => return None,
                         };
 
                         if let hir_map::NodeExpr(expr) = borrow_node {
-                            if !expr_borrows_node_id(&tcx, node_id, expr) {
+                            if !expr_borrows_node_id(&tcx, node_id, expr, false) {
                                 return None;
                             }
 
@@ -210,9 +211,12 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
                                 ty::BorrowKind::UniqueImmBorrow => Kind::UniqueImmutable,
                             };
 
+                            debug!("Loan scope: {:?}", loan_scope);
                             let loan_span = loan_scope
-                                .span(&tcx.region_maps, &tcx.hir)
-                                .and_then(|s| get_unexpanded_span(s, &tcx));
+                                .span(&tcx.hir)
+                                .and_then(|s| get_unexpanded_span(s, fn_span));
+
+                            debug!("Loan span: {:?}", loan_span);
                             let loan_span = match loan_span {
                                 Some(span) => span,
                                 None => return None,
@@ -243,17 +247,17 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
                         // leads to some obviously (though it more rarely might not be)
                         // incorrect spans;
                         let gen_span = loan.gen_scope()
-                            .span(&tcx.region_maps, &tcx.hir)
-                            .and_then(|s| get_unexpanded_span(s, &tcx));
+                            .span(&tcx.hir)
+                            .and_then(|s| get_unexpanded_span(s, fn_span));
                         let kill_span = loan.kill_scope()
-                            .span(&tcx.region_maps, &tcx.hir)
-                            .and_then(|s| get_unexpanded_span(s, &tcx));
+                            .span(&tcx.hir)
+                            .and_then(|s| get_unexpanded_span(s, fn_span));
 
                         if let (Some(gen_span), Some(kill_span)) = (gen_span, kill_span) {
                             let borrow_span = syntax_pos::Span{
                                 lo: gen_span.lo,
                                 hi: kill_span.hi,
-                                expn_id: syntax_pos::NO_EXPANSION
+                                ctxt: syntax_pos::NO_EXPANSION
                             };
                             Some(region_constructor(tcx, kind, borrow_span))
                         } else {
@@ -278,8 +282,8 @@ impl<'a, 'b: 'a> CompilerCalls<'a> for BorrowCalls<'b> {
     }
 }
 
-fn expr_borrows_node_id<'a, 'tcx>(tcx: &TyCtxt<'a, 'tcx, 'tcx>, id: ast::NodeId, expr: &hir::Expr) -> bool {
-    debug!("Expr: {:?}\nExpr.node: {:?}", expr, expr.node);
+fn expr_borrows_node_id<'a, 'tcx>(tcx: &TyCtxt<'a, 'tcx, 'tcx>, id: ast::NodeId, expr: &hir::Expr, is_ref: bool) -> bool {
+    debug!("Expr: {:?}\n{:?}", expr, expr.node);
     match expr.node {
         // Here we should be ok since we only check paths, we're
         // verifying we only support paths to our node_id or
@@ -287,14 +291,24 @@ fn expr_borrows_node_id<'a, 'tcx>(tcx: &TyCtxt<'a, 'tcx, 'tcx>, id: ast::NodeId,
         // If more case are added, then this logic may need to change
         // to account for that. I don't think we need to account for
         // others at this time.
-        hir::Expr_::ExprAddrOf(_, ref e) => {
-            expr_borrows_node_id(tcx, id, &*e)
+        hir::Expr_::ExprAddrOf(_, ref e) => expr_borrows_node_id(tcx, id, &*e, true),
+        hir::Expr_::ExprMatch(ref e, ref arms, ..) => {
+            for &hir::Arm { ref pats, .. } in arms.iter() {
+                for pat in pats.iter() {
+                    debug!("Arm pattern: {:?}", pat);
+                }
+            }
+            expr_borrows_node_id(tcx, id, &*e, false)
         },
-        hir::Expr_::ExprPath(hir::QPath::Resolved(_, ref path)) => {
+        hir::Expr_::ExprTup(ref vec) => vec.iter().any(|e| expr_borrows_node_id(tcx, id, e, false)),
+        hir::Expr_::ExprPath(hir::QPath::Resolved(_, ref path)) if is_ref => {
+            debug!("Def: {:?}", path.def);
             match path.def {
                 hir::def::Def::Local(def_id) |
                 hir::def::Def::Upvar(def_id, ..) => {
+                    debug!("DefId: {:?}\nDefPath: {}", def_id, tcx.hir.def_path(def_id).to_string(*tcx));
                     if let Some(node_id) = tcx.hir.as_local_node_id(def_id) {
+                        debug!("Node id: {:?}", node_id);
                         if node_id == id {
                             return true;
                         }
@@ -309,36 +323,29 @@ fn expr_borrows_node_id<'a, 'tcx>(tcx: &TyCtxt<'a, 'tcx, 'tcx>, id: ast::NodeId,
     }
 }
 
-fn get_unexpanded_span<'a, 'tcx>(input_span: syntax_pos::Span, tcx: &TyCtxt<'a, 'tcx, 'tcx>) -> Option<syntax_pos::Span> {
-    let cm = tcx.sess.codemap();
+fn get_unexpanded_span<'a, 'tcx>(input_span: syntax_pos::Span, wrapping_span: syntax_pos::Span) -> Option<syntax_pos::Span> {
     // Walk up the macro expansion chain until we reach a non-expanded span.
-    let mut span = input_span;
-    while span.expn_id != syntax_pos::NO_EXPANSION && span.expn_id != syntax_pos::COMMAND_LINE_EXPN {
-        if let Some(callsite_span) = cm.with_expn_info(span.expn_id,
-                                            |ei| ei.map(|ei| ei.call_site.clone())) {
-            span = callsite_span;
-        } else {
-            // There are no unexpanded spans, so we can't generate a span
-            // for the current file.
-            return None;
-        }
+    let span = syntax::codemap::original_sp(input_span, wrapping_span);
+    if span == wrapping_span {
+        None // We traversed to the top and couldn't find any matching span
+    } else {
+        Some(span)
     }
-
-    Some(span)
 }
 
 fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: BytePos, line: &Range<BytePos>)
-        -> Option<(syntax::ast::NodeId, Option<hir_map::Node<'tcx>>, blocks::FnLikeNode<'tcx>, hir_map::Node<'tcx>)> {
+        -> Option<(syntax::ast::NodeId, Option<hir_map::Node<'tcx>>, blocks::FnLikeNode<'tcx>, hir_map::Node<'tcx>, syntax::ast::NodeId)> {
     debug!("Searching for node");
-    for def_id in tcx.maps.typeck_tables.borrow().keys() {
-        let tables = tcx.maps.typeck_tables.borrow();
+    for def_id in tcx.maps.typeck_tables_of.borrow().keys() {
+        debug!("DefId: {:?}\nDefPath: {}", def_id, tcx.hir.def_path(def_id).to_string(tcx));
+        let tables = tcx.maps.typeck_tables_of.borrow();
         let entry = tables.get(&def_id).unwrap();
         let def_span = match tcx.hir.span_if_local(def_id) {
             Some(sp) => sp,
             None => continue,
         };
 
-        if def_span.expn_id != syntax_pos::NO_EXPANSION {
+        if def_span.ctxt != syntax_pos::NO_EXPANSION {
             continue;
         }
 
@@ -349,7 +356,6 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: By
 
         debug!("Found potential matching def! {:?}", def_id);
         debug!("Def Span: {:?}", def_span);
-        debug!("Cursor: {}", offset.0);
 
         for (&id, _) in entry.node_types.iter() {
             let node = if let Some(node) = tcx.hir.find(id) {
@@ -365,7 +371,7 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: By
 
             let sp = tcx.hir.span(id);
             // Avoid peeking at macro expansions.
-            if sp.expn_id != syntax_pos::NO_EXPANSION {
+            if sp.ctxt != syntax_pos::NO_EXPANSION {
                 continue;
             }
 
@@ -420,7 +426,7 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: By
 }
 
 fn get_fn_node<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, id: syntax::ast::NodeId, node: Option<hir_map::Node<'tcx>>)
-        -> Option<(syntax::ast::NodeId, Option<hir_map::Node<'tcx>>, blocks::FnLikeNode<'tcx>, hir_map::Node<'tcx>)> {
+        -> Option<(syntax::ast::NodeId, Option<hir_map::Node<'tcx>>, blocks::FnLikeNode<'tcx>, hir_map::Node<'tcx>, syntax::ast::NodeId)> {
     let mut old_id = id;
     let mut parent_id = tcx.hir.get_parent_node(id);
     loop {
@@ -438,7 +444,7 @@ fn get_fn_node<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, id: syntax::ast::NodeId, n
 
         let code = blocks::Code::from_node(&tcx.hir, parent_id);
         if let Some(blocks::Code::FnLike(fn_like)) = code {
-            return Some((id, node, fn_like, parent_node));
+            return Some((id, node, fn_like, parent_node, parent_id));
         } else {
             // we need to jump higher
             old_id = parent_id;
