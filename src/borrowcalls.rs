@@ -12,6 +12,7 @@ use syntax;
 use error;
 
 use rustc::cfg;
+use rustc::dep_graph::DepNode;
 use rustc::hir::{self, map as hir_map};
 use rustc::hir::map::blocks;
 use rustc::session::config::{self, Input};
@@ -336,10 +337,10 @@ fn get_unexpanded_span<'a, 'tcx>(input_span: syntax_pos::Span, wrapping_span: sy
 fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: BytePos, line: &Range<BytePos>)
         -> Option<(syntax::ast::NodeId, Option<hir_map::Node<'tcx>>, blocks::FnLikeNode<'tcx>, hir_map::Node<'tcx>, syntax::ast::NodeId)> {
     debug!("Searching for node");
-    for def_id in tcx.maps.typeck_tables_of.borrow().keys() {
+    for (body_id, _) in tcx.hir.forest.krate().bodies.iter() {
+        let def_id = tcx.hir.body_owner_def_id(*body_id);
         debug!("DefId: {:?}\nDefPath: {}", def_id, tcx.hir.def_path(def_id).to_string(tcx));
-        let tables = tcx.maps.typeck_tables_of.borrow();
-        let entry = tables.get(&def_id).unwrap();
+        let entry = tcx.typeck_tables_of(def_id);
         let def_span = match tcx.hir.span_if_local(def_id) {
             Some(sp) => sp,
             None => continue,
@@ -398,13 +399,7 @@ fn nodeid_from_offset_and_line<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, offset: By
                     }
 
                     let def_id = def_id.unwrap();
-                    let entry = tables.get(&def_id);
-                    if entry.is_none() {
-                        debug!("None entry :(");
-                        continue;
-                    }
-
-                    let entry = entry.unwrap();
+                    let entry = tcx.typeck_tables_of(def_id);
                     for (&id, _) in entry.node_types.iter() {
                         let node = tcx.hir.find(id);
                         debug!("Node for pattern: {:?}", node);
