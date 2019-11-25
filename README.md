@@ -1,5 +1,7 @@
 # borrow_visualizer_prototype
 
+**No longer maintained**
+
 This is a prototype, and one that will only be used temporarily. The long term plan is to integrate the ideas learned here into https://github.com/rust-lang-nursery/rls
 
 Dependencies:
